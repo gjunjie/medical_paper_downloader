@@ -1,0 +1,358 @@
+"""
+PMC Paper Downloader
+
+This script searches PubMed Central (PMC) and downloads the top k papers in PDF format.
+"""
+
+import os
+import time
+import urllib.parse
+from pathlib import Path
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+
+def download_pmc_papers(search_term: str, k: int = 5, download_dir: str = "downloads", headless: bool = True):
+    """
+    Search PMC and download the top k papers in PDF format.
+    
+    Args:
+        search_term: The search term (e.g., "vitamin c")
+        k: Number of top papers to download (default: 5)
+        download_dir: Directory to save downloaded PDFs (default: "downloads")
+        headless: Whether to run browser in headless mode (default: True)
+    
+    Returns:
+        List of downloaded file paths
+    """
+    # Create download directory if it doesn't exist
+    download_path = Path(download_dir)
+    download_path.mkdir(exist_ok=True)
+    
+    # Construct search URL
+    encoded_term = urllib.parse.quote(search_term)
+    search_url = f"https://pmc.ncbi.nlm.nih.gov/search/?term={encoded_term}"
+    
+    downloaded_files = []
+    
+    with sync_playwright() as p:
+        # Launch browser
+        browser = p.chromium.launch(headless=headless)
+        context = browser.new_context(
+            accept_downloads=True,
+            viewport={"width": 1920, "height": 1080}
+        )
+        page = context.new_page()
+        
+        try:
+            print(f"Searching PMC for: {search_term}")
+            print(f"Search URL: {search_url}")
+            
+            # Navigate to search results
+            page.goto(search_url, wait_until="networkidle", timeout=5000)
+            time.sleep(1)  # Wait for page to fully load
+            
+            # Find all result links
+            # PMC search results typically have links with class or data attributes
+            # We'll look for links that contain PMC IDs
+            result_links = []
+            
+            # Try multiple selectors to find result links
+            selectors = [
+                'a[href*="/articles/PMC"]',
+                'a[href*="pmc/articles"]',
+                '.result-item a',
+                '.rprt a',
+                'a[data-article-id]'
+            ]
+            
+            for selector in selectors:
+                links = page.query_selector_all(selector)
+                if links:
+                    for link in links:
+                        href = link.get_attribute('href')
+                        if href and ('PMC' in href or '/articles/' in href):
+                            # Make absolute URL if needed
+                            if href.startswith('/'):
+                                href = f"https://pmc.ncbi.nlm.nih.gov{href}"
+                            elif not href.startswith('http'):
+                                href = f"https://pmc.ncbi.nlm.nih.gov/{href}"
+                            
+                            if href not in result_links:
+                                result_links.append(href)
+                    if result_links:
+                        break
+            
+            # If no links found with selectors, try to find by text pattern
+            if not result_links:
+                print("Trying alternative method to find results...")
+                # Look for any links that might be article links
+                all_links = page.query_selector_all('a')
+                for link in all_links:
+                    href = link.get_attribute('href')
+                    if href and ('/articles/PMC' in href or 'pmc/articles' in href):
+                        if href.startswith('/'):
+                            href = f"https://pmc.ncbi.nlm.nih.gov{href}"
+                        elif not href.startswith('http'):
+                            href = f"https://pmc.ncbi.nlm.nih.gov/{href}"
+                        if href not in result_links:
+                            result_links.append(href)
+            
+            if not result_links:
+                print("No results found. The page structure might have changed.")
+                print("Page title:", page.title())
+                # Save page for debugging
+                page.screenshot(path="debug_search_page.png")
+                return downloaded_files
+            
+            # Limit to top k results
+            result_links = result_links[:k]
+            print(f"Found {len(result_links)} result(s) to process")
+            
+            # Process each result
+            for i, article_url in enumerate(result_links, 1):
+                try:
+                    print(f"\n[{i}/{len(result_links)}] Processing: {article_url}")
+                    
+                    # Extract PMC ID from article URL
+                    # URL format: https://pmc.ncbi.nlm.nih.gov/articles/PMC7681026
+                    pmc_id = article_url.split('/')[-1] if '/' in article_url else None
+                    
+                    # Navigate to article page
+                    page.goto(article_url, wait_until="networkidle", timeout=5000)
+                    time.sleep(1)
+                    
+                    # Look for PDF link that follows the pattern: /articles/{PMC_ID}/pdf/{filename}.pdf
+                    # Example: https://pmc.ncbi.nlm.nih.gov/articles/PMC7681026/pdf/zbc15870.pdf
+                    pdf_link = None
+                    
+                    # Priority 1: Look for PDF link with the exact pattern /articles/{PMC_ID}/pdf/{filename}.pdf
+                    if pmc_id:
+                        # Try exact pattern first: /articles/PMC7681026/pdf/
+                        pdf_links = page.query_selector_all(f'a[href*="/articles/{pmc_id}/pdf/"]')
+                        if not pdf_links:
+                            # Also try without "PMC" prefix in case URL format differs
+                            pmc_num = pmc_id.replace('PMC', '') if pmc_id.startswith('PMC') else pmc_id
+                            pdf_links = page.query_selector_all(f'a[href*="/articles/{pmc_num}/pdf/"]')
+                        
+                        if pdf_links:
+                            for link in pdf_links:
+                                href = link.get_attribute('href')
+                                if href:
+                                    # Normalize the href to full URL
+                                    if href.startswith('/'):
+                                        full_href = f"https://pmc.ncbi.nlm.nih.gov{href}"
+                                    elif not href.startswith('http'):
+                                        full_href = f"https://pmc.ncbi.nlm.nih.gov/{href}"
+                                    else:
+                                        full_href = href
+                                    
+                                    # Check if it matches the pattern /articles/{PMC_ID}/pdf/{filename}.pdf
+                                    if f'/articles/{pmc_id}/pdf/' in full_href and full_href.endswith('.pdf'):
+                                        pdf_link = full_href
+                                        break
+                                    # Also check pattern with just the number
+                                    elif pmc_id.startswith('PMC'):
+                                        pmc_num = pmc_id.replace('PMC', '')
+                                        if f'/articles/{pmc_num}/pdf/' in full_href and full_href.endswith('.pdf'):
+                                            pdf_link = full_href
+                                            break
+                                    # If it contains the pattern but might be missing .pdf extension
+                                    elif f'/articles/{pmc_id}/pdf/' in full_href:
+                                        pdf_link = full_href
+                                        break
+                        
+                        # Also look for links with text "PDF" that might have the pattern
+                        if not pdf_link:
+                            pdf_text_links = page.query_selector_all('a:has-text("PDF"), a:has-text("pdf")')
+                            for link in pdf_text_links:
+                                href = link.get_attribute('href')
+                                if href and f'/articles/{pmc_id}/pdf/' in href:
+                                    if href.startswith('/'):
+                                        pdf_link = f"https://pmc.ncbi.nlm.nih.gov{href}"
+                                    elif not href.startswith('http'):
+                                        pdf_link = f"https://pmc.ncbi.nlm.nih.gov/{href}"
+                                    else:
+                                        pdf_link = href
+                                    break
+                    
+                    # Priority 2: If we found a PDF link but it's not in the full pattern, try to construct it
+                    # Some pages use links like /pdf/filename.pdf or https://pmc.ncbi.nlm.nih.gov/pdf/filename.pdf
+                    # We want to use the pattern: /articles/{PMC_ID}/pdf/{filename}.pdf
+                    if not pdf_link and pmc_id:
+                        # Look for any PDF link and try to construct the full path
+                        all_pdf_links = page.query_selector_all('a[href*=".pdf"], a[href*="/pdf/"]')
+                        for link in all_pdf_links:
+                            href = link.get_attribute('href')
+                            if href and href.endswith('.pdf'):
+                                # Extract filename from any format
+                                filename = href.split('/')[-1]
+                                
+                                # If the link doesn't already follow the /articles/{PMC_ID}/pdf/ pattern,
+                                # construct it using the full pattern
+                                if f'/articles/{pmc_id}/pdf/' not in href:
+                                    # Construct the full pattern: /articles/{PMC_ID}/pdf/{filename}
+                                    constructed_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_id}/pdf/{filename}"
+                                    pdf_link = constructed_url
+                                    break
+                                # If it already contains the PMC ID in the correct pattern, use it
+                                elif f'/articles/{pmc_id}/pdf/' in href:
+                                    if href.startswith('/'):
+                                        pdf_link = f"https://pmc.ncbi.nlm.nih.gov{href}"
+                                    elif not href.startswith('http'):
+                                        pdf_link = f"https://pmc.ncbi.nlm.nih.gov/{href}"
+                                    else:
+                                        pdf_link = href
+                                    break
+                    
+                    # Priority 3: Fallback - look for any PDF link on the page and construct full path if needed
+                    if not pdf_link and pmc_id:
+                        pdf_button_selectors = [
+                            'a[href*="/pdf/"]',
+                            'a[href$=".pdf"]',
+                            'a[href*=".pdf"]',
+                            'a:has-text("PDF")',
+                            'a[title*="PDF"]',
+                            'a[title*="pdf"]'
+                        ]
+                        
+                        for selector in pdf_button_selectors:
+                            try:
+                                element = page.query_selector(selector)
+                                if element:
+                                    href = element.get_attribute('href')
+                                    if href and href.endswith('.pdf'):
+                                        # Extract filename
+                                        filename = href.split('/')[-1]
+                                        # Always construct using the full pattern: /articles/{PMC_ID}/pdf/{filename}
+                                        pdf_link = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_id}/pdf/{filename}"
+                                        break
+                            except:
+                                continue
+                    
+                    # Download the PDF
+                    if pdf_link:
+                        try:
+                            print(f"  Found PDF link: {pdf_link}")
+                            
+                            # Extract filename from URL
+                            filename = pdf_link.split('/')[-1]
+                            if not filename.endswith('.pdf'):
+                                filename = f"{pmc_id or f'paper_{i}'}.pdf"
+                            
+                            # PMC PDFs require clicking the link to trigger download
+                            # Try multiple methods to download the PDF
+                            pdf_downloaded = False
+                            
+                            # Method 1: Try to find and click the PDF link on the article page
+                            pdf_link_selectors = [
+                                f'a[href*="/articles/{pmc_id}/pdf/"]',
+                                f'a[href*="/pdf/"]',
+                                'a:has-text("PDF")',
+                                'a[href$=".pdf"]'
+                            ]
+                            
+                            for selector in pdf_link_selectors:
+                                try:
+                                    pdf_element = page.query_selector(selector)
+                                    if pdf_element:
+                                        # Scroll element into view
+                                        pdf_element.scroll_into_view_if_needed()
+                                        time.sleep(0.3)
+                                        # Click the link and wait for download
+                                        with page.expect_download(timeout=5000) as download_info:
+                                            pdf_element.click()
+                                        download = download_info.value
+                                        
+                                        # Get suggested filename or use extracted one
+                                        suggested_filename = download.suggested_filename
+                                        if suggested_filename and suggested_filename.endswith('.pdf'):
+                                            filename = suggested_filename
+                                        
+                                        file_path = download_path / filename
+                                        download.save_as(file_path)
+                                        downloaded_files.append(str(file_path))
+                                        print(f"  ✓ Downloaded: {file_path}")
+                                        pdf_downloaded = True
+                                        break
+                                except (PlaywrightTimeoutError, Exception):
+                                    continue
+                            
+                            # Method 2: Use request API with proper headers to follow redirects
+                            if not pdf_downloaded:
+                                try:
+                                    # Set headers to mimic a browser request
+                                    response = context.request.get(
+                                        pdf_link,
+                                        headers={
+                                            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                                            'Accept': 'application/pdf,application/octet-stream,*/*'
+                                        },
+                                        timeout=5000
+                                    )
+                                    
+                                    if response.ok:
+                                        body = response.body()
+                                        # Check if it's actually a PDF
+                                        if body.startswith(b'%PDF'):
+                                            file_path = download_path / filename
+                                            with open(file_path, 'wb') as f:
+                                                f.write(body)
+                                            downloaded_files.append(str(file_path))
+                                            print(f"  ✓ Downloaded: {file_path}")
+                                            pdf_downloaded = True
+                                except Exception as req_error:
+                                    pass
+                            
+                            # Method 3: Try direct navigation with download event
+                            if not pdf_downloaded:
+                                try:
+                                    with page.expect_download(timeout=5000) as download_info:
+                                        page.goto(pdf_link, wait_until="networkidle", timeout=5000)
+                                    download = download_info.value
+                                    file_path = download_path / filename
+                                    download.save_as(file_path)
+                                    downloaded_files.append(str(file_path))
+                                    print(f"  ✓ Downloaded: {file_path}")
+                                    pdf_downloaded = True
+                                except (PlaywrightTimeoutError, Exception):
+                                    pass
+                            
+                            if not pdf_downloaded:
+                                raise Exception("All download methods failed")
+                                    
+                        except Exception as e:
+                            print(f"  ✗ Error downloading PDF: {e}")
+                    else:
+                        print(f"  ✗ Could not find PDF link for article {i}")
+                    
+                    # Small delay between downloads
+                    time.sleep(0.5)
+                    
+                except Exception as e:
+                    print(f"  ✗ Error processing article {i}: {e}")
+                    continue
+            
+        except Exception as e:
+            print(f"Error during search/download process: {e}")
+        finally:
+            browser.close()
+    
+    print(f"\n✓ Download complete! {len(downloaded_files)} file(s) downloaded to {download_dir}/")
+    return downloaded_files
+
+
+if __name__ == "__main__":
+    # Example usage
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage: python paper_downloader.py <search_term> [k] [download_dir]")
+        print("Example: python paper_downloader.py 'vitamin c' 5")
+        sys.exit(1)
+    
+    search_term = sys.argv[1]
+    k = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+    download_dir = sys.argv[3] if len(sys.argv) > 3 else "downloads"
+    
+    download_pmc_papers(search_term, k, download_dir, headless=False)
+
