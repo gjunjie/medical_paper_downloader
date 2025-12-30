@@ -5,6 +5,7 @@ This script searches PubMed Central (PMC) and downloads the top k papers in PDF 
 """
 
 import os
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -39,7 +40,19 @@ def download_pmc_papers(search_term: str, k: int = 5, download_dir: str = "downl
         browser = p.chromium.launch(headless=headless)
         context = browser.new_context(
             accept_downloads=True,
-            viewport={"width": 1920, "height": 1080}
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            extra_http_headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+            }
         )
         page = context.new_page()
         
@@ -330,6 +343,390 @@ def download_pmc_papers(search_term: str, k: int = 5, download_dir: str = "downl
                     
                 except Exception as e:
                     print(f"  ✗ Error processing article {i}: {e}")
+                    continue
+            
+        except Exception as e:
+            print(f"Error during search/download process: {e}")
+        finally:
+            browser.close()
+    
+    print(f"\n✓ Download complete! {len(downloaded_files)} file(s) downloaded to {download_dir}/")
+    return downloaded_files
+
+
+def download_pubmed_free_fulltext_papers(search_term: str, k: int = 5, download_dir: str = "downloads", headless: bool = True):
+    """
+    Search PubMed and download PDFs from PMC.
+    
+    Workflow:
+    1. Search PubMed with the search term
+    2. Extract PubMed links (PMID) for each paper
+    3. Navigate to each PubMed page to get the PMCID
+    4. Navigate to PMC article page using the PMCID
+    5. Download the PDF from PMC
+    
+    Args:
+        search_term: The search term (e.g., "probiotics oral health")
+        k: Number of top papers to download (default: 5)
+        download_dir: Directory to save downloaded PDFs (default: "downloads")
+        headless: Whether to run browser in headless mode (default: True)
+    
+    Returns:
+        List of downloaded file paths
+    """
+    # Create download directory if it doesn't exist
+    download_path = Path(download_dir)
+    download_path.mkdir(exist_ok=True)
+    
+    # Construct PubMed search URL
+    encoded_term = urllib.parse.quote(search_term)
+    search_url = f"https://pubmed.ncbi.nlm.nih.gov/?term={encoded_term}"
+    
+    downloaded_files = []
+    
+    with sync_playwright() as p:
+        # Launch browser
+        browser = p.chromium.launch(headless=headless)
+        context = browser.new_context(
+            accept_downloads=True,
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            extra_http_headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+            }
+        )
+        page = context.new_page()
+        
+        try:
+            print(f"Searching PubMed for: {search_term}")
+            print(f"Search URL: {search_url}")
+            print("Navigating to PubMed...")
+            
+            # Navigate to PubMed search results
+            try:
+                page.goto(search_url, wait_until="networkidle", timeout=15000)
+            except Exception as nav_error:
+                print(f"Navigation timeout, trying with load state...")
+                page.goto(search_url, wait_until="load", timeout=15000)
+            time.sleep(3)  # Wait for page to fully load
+            print(f"Page loaded. Title: {page.title()}")
+            print(f"Current URL: {page.url}")
+            
+            # Wait for results to load - look for result items
+            try:
+                page.wait_for_selector('.docsum-content, .rprt, article, [class*="result"]', timeout=10000)
+            except:
+                print("Warning: Results may not have loaded completely")
+            
+            # Find all PubMed result links (PMID links)
+            # PubMed result links typically look like: /28390121/ or https://pubmed.ncbi.nlm.nih.gov/28390121/
+            pubmed_links = []
+            
+            # Try multiple selectors to find result links - updated for current PubMed structure
+            selectors = [
+                '.docsum-title a',  # Most common selector for PubMed results
+                'a.docsum-title',   # Alternative class format
+                '.rprt a',          # Alternative result format
+                'article a',        # Article tag links
+                'a[href*="/pubmed/"]',  # Links containing /pubmed/
+                'a[href^="/"]',     # Any link starting with /
+            ]
+            
+            for selector in selectors:
+                try:
+                    links = page.query_selector_all(selector)
+                    if links:
+                        print(f"Found {len(links)} links with selector: {selector}")
+                        for link in links:
+                            href = link.get_attribute('href')
+                            if href:
+                                # Extract PMID from various URL patterns
+                                # Patterns: /28390121/, /pubmed/28390121/, https://pubmed.ncbi.nlm.nih.gov/28390121/
+                                pmid_match = re.search(r'/(\d{6,})/?$', href) or re.search(r'pubmed[^/]*/(\d{6,})', href)
+                                if pmid_match:
+                                    pmid = pmid_match.group(1)
+                                    pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                                    if pubmed_url not in pubmed_links:
+                                        pubmed_links.append(pubmed_url)
+                        if pubmed_links:
+                            print(f"Successfully extracted {len(pubmed_links)} PubMed links")
+                            break
+                except Exception as e:
+                    continue
+            
+            # Alternative method: look for any links with numeric IDs that match PMID pattern
+            if not pubmed_links:
+                print("Trying alternative method to find PubMed links...")
+                all_links = page.query_selector_all('a[href]')
+                print(f"Found {len(all_links)} total links on page")
+                for link in all_links:
+                    href = link.get_attribute('href')
+                    if href:
+                        # Look for patterns like /12345678/ or /pubmed/12345678/ or pubmed.ncbi.nlm.nih.gov/12345678/
+                        # PMIDs are typically 6-8 digits
+                        pmid_match = re.search(r'/(\d{6,})/?$', href) or re.search(r'pubmed[^/]*/(\d{6,})', href)
+                        if pmid_match:
+                            pmid = pmid_match.group(1)
+                            # Validate it's a reasonable PMID (not a year or other number)
+                            if len(pmid) >= 6 and len(pmid) <= 8:
+                                pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                                if pubmed_url not in pubmed_links:
+                                    pubmed_links.append(pubmed_url)
+                                    if len(pubmed_links) >= k * 2:  # Get extra to filter
+                                        break
+            
+            if not pubmed_links:
+                print("No PubMed results found. The page structure might have changed.")
+                print("Page title:", page.title())
+                print("Page URL:", page.url)
+                # Save page for debugging
+                page.screenshot(path="debug_pubmed_search_page.png")
+                # Also save HTML for inspection
+                with open("debug_pubmed_search_page.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                print("Debug files saved: debug_pubmed_search_page.png and debug_pubmed_search_page.html")
+                return downloaded_files
+            
+            # Limit to top k results
+            pubmed_links = pubmed_links[:k]
+            print(f"Found {len(pubmed_links)} PubMed result(s) to process")
+            
+            # Process each PubMed result
+            for i, pubmed_url in enumerate(pubmed_links, 1):
+                try:
+                    print(f"\n[{i}/{len(pubmed_links)}] Processing PubMed: {pubmed_url}")
+                    
+                    # Extract PMID from URL
+                    pmid_match = re.search(r'/(\d+)/?$', pubmed_url)
+                    pmid = pmid_match.group(1) if pmid_match else None
+                    
+                    # Navigate to PubMed page
+                    page.goto(pubmed_url, wait_until="networkidle", timeout=10000)
+                    time.sleep(2)
+                    
+                    # Extract PMCID from the PubMed page
+                    # PMCID is usually shown in the "Full text links" section or as a link to PMC
+                    pmc_id = None
+                    pmc_link = None
+                    
+                    # First, try to find in the "Full text links" section
+                    try:
+                        # Look for the full text links section
+                        fulltext_section = page.query_selector('#full-view-heading, .full-text-links, [id*="full"], [class*="full-text"]')
+                        if fulltext_section:
+                            pmc_links_in_section = fulltext_section.query_selector_all('a[href*="PMC"], a[href*="pmc"]')
+                            for pmc_link_elem in pmc_links_in_section:
+                                href = pmc_link_elem.get_attribute('href')
+                                if href:
+                                    pmc_match = re.search(r'PMC(\d+)', href, re.IGNORECASE)
+                                    if pmc_match:
+                                        pmc_id = f"PMC{pmc_match.group(1)}"
+                                        if href.startswith('/'):
+                                            pmc_link = f"https://pmc.ncbi.nlm.nih.gov{href}"
+                                        elif not href.startswith('http'):
+                                            pmc_link = f"https://pmc.ncbi.nlm.nih.gov/{href}"
+                                        else:
+                                            pmc_link = href
+                                        break
+                    except:
+                        pass
+                    
+                    # Look for PMC links anywhere on the page
+                    if not pmc_id:
+                        pmc_link_selectors = [
+                            'a[href*="/articles/PMC"]',
+                            'a[href*="pmc.ncbi.nlm.nih.gov"]',
+                            'a[href*="PMC"]',
+                            'a:has-text("PMC")',
+                            'a:has-text("Free PMC")',
+                            'a:has-text("PubMed Central")'
+                        ]
+                        
+                        for selector in pmc_link_selectors:
+                            try:
+                                pmc_links = page.query_selector_all(selector)
+                                if pmc_links:
+                                    for pmc_link_elem in pmc_links:
+                                        href = pmc_link_elem.get_attribute('href')
+                                        if href and ('PMC' in href.upper() or '/articles/' in href):
+                                            # Extract PMC ID from URL
+                                            pmc_match = re.search(r'PMC(\d+)', href, re.IGNORECASE)
+                                            if pmc_match:
+                                                pmc_id = f"PMC{pmc_match.group(1)}"
+                                                # Construct full PMC URL
+                                                if href.startswith('/'):
+                                                    pmc_link = f"https://pmc.ncbi.nlm.nih.gov{href}"
+                                                elif not href.startswith('http'):
+                                                    pmc_link = f"https://pmc.ncbi.nlm.nih.gov/{href}"
+                                                else:
+                                                    pmc_link = href
+                                                break
+                                    if pmc_id:
+                                        break
+                            except:
+                                continue
+                    
+                    # Alternative: Look for PMCID in the page text/content
+                    if not pmc_id:
+                        try:
+                            page_content = page.content()
+                            # Look for PMC ID in various formats
+                            pmc_match = re.search(r'PMC(\d{6,})', page_content, re.IGNORECASE)
+                            if pmc_match:
+                                pmc_id = f"PMC{pmc_match.group(1)}"
+                                pmc_link = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_id}/"
+                        except:
+                            pass
+                    
+                    if not pmc_id:
+                        print(f"  ✗ Could not find PMCID for PMID {pmid} - skipping (may not be available in PMC)")
+                        continue
+                    
+                    print(f"  Found PMCID: {pmc_id}")
+                    print(f"  PMC Link: {pmc_link}")
+                    
+                    # Navigate to PMC article page
+                    page.goto(pmc_link, wait_until="networkidle", timeout=10000)
+                    time.sleep(2)
+                    
+                    # Find PDF link on PMC page
+                    pdf_link = None
+                    
+                    # Look for PDF link with pattern: /articles/{PMC_ID}/pdf/{filename}.pdf
+                    pdf_link_selectors = [
+                        f'a[href*="/articles/{pmc_id}/pdf/"]',
+                        'a[href*="/pdf/"]',
+                        'a:has-text("PDF")',
+                        'a[href$=".pdf"]',
+                        'a[title*="PDF"]'
+                    ]
+                    
+                    for selector in pdf_link_selectors:
+                        pdf_links = page.query_selector_all(selector)
+                        if pdf_links:
+                            for pdf_link_elem in pdf_links:
+                                href = pdf_link_elem.get_attribute('href')
+                                if href and '.pdf' in href:
+                                    # Normalize the href to full URL
+                                    if href.startswith('/'):
+                                        full_href = f"https://pmc.ncbi.nlm.nih.gov{href}"
+                                    elif not href.startswith('http'):
+                                        full_href = f"https://pmc.ncbi.nlm.nih.gov/{href}"
+                                    else:
+                                        full_href = href
+                                    
+                                    # Check if it matches the pattern /articles/{PMC_ID}/pdf/{filename}.pdf
+                                    if f'/articles/{pmc_id}/pdf/' in full_href and full_href.endswith('.pdf'):
+                                        pdf_link = full_href
+                                        break
+                            if pdf_link:
+                                break
+                    
+                    # If PDF link not found, try to construct it
+                    if not pdf_link and pmc_id:
+                        # Look for any PDF link and extract filename
+                        all_pdf_links = page.query_selector_all('a[href*=".pdf"]')
+                        for pdf_link_elem in all_pdf_links:
+                            href = pdf_link_elem.get_attribute('href')
+                            if href and href.endswith('.pdf'):
+                                filename = href.split('/')[-1]
+                                pdf_link = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_id}/pdf/{filename}"
+                                break
+                    
+                    # Download the PDF
+                    if pdf_link:
+                        try:
+                            print(f"  Found PDF link: {pdf_link}")
+                            
+                            # Extract filename from URL
+                            filename = pdf_link.split('/')[-1]
+                            if not filename.endswith('.pdf'):
+                                filename = f"{pmc_id}.pdf"
+                            
+                            pdf_downloaded = False
+                            
+                            # Method 1: Try to click PDF link
+                            for selector in pdf_link_selectors:
+                                try:
+                                    pdf_element = page.query_selector(selector)
+                                    if pdf_element:
+                                        pdf_element.scroll_into_view_if_needed()
+                                        time.sleep(0.3)
+                                        with page.expect_download(timeout=10000) as download_info:
+                                            pdf_element.click()
+                                        download = download_info.value
+                                        
+                                        suggested_filename = download.suggested_filename
+                                        if suggested_filename and suggested_filename.endswith('.pdf'):
+                                            filename = suggested_filename
+                                        
+                                        file_path = download_path / filename
+                                        download.save_as(file_path)
+                                        downloaded_files.append(str(file_path))
+                                        print(f"  ✓ Downloaded: {file_path}")
+                                        pdf_downloaded = True
+                                        break
+                                except (PlaywrightTimeoutError, Exception):
+                                    continue
+                            
+                            # Method 2: Use request API
+                            if not pdf_downloaded:
+                                try:
+                                    response = context.request.get(
+                                        pdf_link,
+                                        headers={
+                                            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                                            'Accept': 'application/pdf,application/octet-stream,*/*'
+                                        },
+                                        timeout=10000
+                                    )
+                                    
+                                    if response.ok:
+                                        body = response.body()
+                                        if body.startswith(b'%PDF'):
+                                            file_path = download_path / filename
+                                            with open(file_path, 'wb') as f:
+                                                f.write(body)
+                                            downloaded_files.append(str(file_path))
+                                            print(f"  ✓ Downloaded: {file_path}")
+                                            pdf_downloaded = True
+                                except Exception as req_error:
+                                    pass
+                            
+                            # Method 3: Direct navigation
+                            if not pdf_downloaded:
+                                try:
+                                    with page.expect_download(timeout=10000) as download_info:
+                                        page.goto(pdf_link, wait_until="networkidle", timeout=10000)
+                                    download = download_info.value
+                                    file_path = download_path / filename
+                                    download.save_as(file_path)
+                                    downloaded_files.append(str(file_path))
+                                    print(f"  ✓ Downloaded: {file_path}")
+                                    pdf_downloaded = True
+                                except (PlaywrightTimeoutError, Exception):
+                                    pass
+                            
+                            if not pdf_downloaded:
+                                print(f"  ✗ Could not download PDF for {pmc_id}")
+                        except Exception as e:
+                            print(f"  ✗ Error downloading PDF: {e}")
+                    else:
+                        print(f"  ✗ Could not find PDF link for {pmc_id}")
+                    
+                    # Small delay between downloads
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    print(f"  ✗ Error processing PubMed result {i}: {e}")
                     continue
             
         except Exception as e:
